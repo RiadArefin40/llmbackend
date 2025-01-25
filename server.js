@@ -13,18 +13,23 @@ app.use(cors());
 app.use(express.json());
 
 
-// Sign up route
-app.post('/signup', (req, res) => {
-    const { name, email, password } = req.body;
 
-    if (!name || !email || !password) {
-        return res.status(400).json({ message: 'Please provide name, email, and password.' });
+// Sign up route
+const crypto = require('crypto'); // For generating unique referral codes
+
+
+app.post('/signup', (req, res) => {
+    const { name, phone_number, password, referralCode } = req.body; // Include referralCode in the request body
+
+    // Validate input fields
+    if (!name || !phone_number || !password) {
+        return res.status(400).json({ message: 'Please provide name, phone_number, and password.' });
     }
 
     // Check if the user already exists
-    db.query('SELECT * FROM users WHERE email = ?', [email], (err, results) => {
+    db.query('SELECT * FROM users WHERE phone_number = ?', [phone_number], (err, results) => {
         if (err) {
-            return res.status(500).json({ message: 'Database error' });
+            return res.status(500).json({ message: 'Database error during user check.' });
         }
 
         if (results.length > 0) {
@@ -37,34 +42,77 @@ app.post('/signup', (req, res) => {
                 return res.status(500).json({ message: 'Error hashing password.' });
             }
 
-            // Insert the new user into the database with `status` as `NULL`
-            db.query('INSERT INTO users (name, email, password, status) VALUES (?, ?, ?, ?)', [name, email, hashedPassword, null], (err, result) => {
-                if (err) {
-                    return res.status(500).json({ message: 'Error saving user to the database.' });
+            // Generate a unique referral code for the new user
+            const userReferralCode = crypto.randomBytes(6).toString('hex'); // 12-character unique code
+
+            // Handle referral logic if referralCode is provided
+            const processReferral = (callback) => {
+                if (!referralCode) {
+                    return callback(null); // No referral code provided, proceed without updating
                 }
 
-                // Generate JWT token
-                const payload = {
-                    userId: result.insertId,  // User ID is taken from the inserted row's ID
-                };
-
-                // Sign the JWT token with the user ID and a secret key
-                const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '6h' });
-
-                // Return the token and user details
-                return res.status(201).json({
-                    message: 'User signed up successfully!',
-                    token: token,  // Include the token in the response
-                    user: {
-                        id: result.insertId,
-                        name: name,
-                        email: email,
+                // Check if the referral code exists in the database
+                db.query('SELECT * FROM users WHERE referral_code = ?', [referralCode], (err, referrerResults) => {
+                    if (err) {
+                        return res.status(500).json({ message: 'Database error while verifying referral code.' });
                     }
+
+                    if (referrerResults.length === 0) {
+                        return res.status(400).json({ message: 'Invalid referral code.' });
+                    }
+
+                    // Increment `pending_referral` for the referrer
+                    const referrerId = referrerResults[0].id;
+                    db.query(
+                        'UPDATE users SET pending_referral = IFNULL(pending_referral, 0) + 1 WHERE id = ?',
+                        [referrerId],
+                        (err) => {
+                            if (err) {
+                                return res.status(500).json({ message: 'Database error while updating referral count.' });
+                            }
+
+                            // Referral processed successfully; pass the referrerId to the callback
+                            return callback(referrerId);
+                        }
+                    );
                 });
+            };
+
+            processReferral((referrerId) => {
+                // Insert the new user into the database
+                db.query(
+                    'INSERT INTO users (name, phone_number, password, status, referral_code, referred_by) VALUES (?, ?, ?, ?, ?, ?)',
+                    [name, phone_number, hashedPassword, null, userReferralCode, referrerId || null],
+                    (err, result) => {
+                        if (err) {
+                            return res.status(500).json({ message: 'Error saving user to the database.' });
+                        }
+
+                        // Generate JWT token
+                        const payload = { userId: result.insertId };
+
+                        const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '6h' });
+
+                        // Return success response with user details and referral info
+                        return res.status(201).json({
+                            message: 'User signed up successfully!',
+                            token: token,
+                            user: {
+                                id: result.insertId,
+                                name: name,
+                                phone_number: phone_number,
+                                referral_code: userReferralCode,
+                                referred_by: referrerId || null, // Referrer's ID, if any
+                            },
+                        });
+                    }
+                );
             });
         });
     });
 });
+
+
 
 
 
@@ -95,7 +143,7 @@ const verifyToken = (req, res, next) => {
 
 
 
-app.patch('/user/:id/update-plan', verifyToken, (req, res) => {
+app.patch('/user/:id/update-plan',  (req, res) => {
     const userId = req.params.id;
     const { plan_name } = req.body; // The new plan name selected by the user
 
@@ -143,18 +191,18 @@ app.patch('/user/:id/update-plan', verifyToken, (req, res) => {
 
 // Login route
 app.post('/login', (req, res) => {
-    const { email, password } = req.body;
+    const { phone_number, password } = req.body;
 
-    if (!email || !password) {
+    if (!phone_number || !password) {
         return res.status(400).json({ message: 'Please provide both email and password.' });
     }
 
     // Find the user by email and get subscription data
     db.query(`
-        SELECT u.id, u.name, u.role, u.email, u.password, s.plan_name, s.price, s.description
+        SELECT u.id, u.name, u.role, u.status, u.phone_number, u.referral_code, u.password, s.plan_name, s.price, s.description
         FROM users u
         LEFT JOIN subscriptions s ON u.subscription_id = s.id
-        WHERE u.email = ?`, [email], async (err, results) => {
+        WHERE u.phone_number = ?`, [phone_number], async (err, results) => {
         if (err) {
             return res.status(500).json({ message: 'Database query error' });
         }
@@ -176,11 +224,14 @@ app.post('/login', (req, res) => {
         const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, { expiresIn: '1h' });
 
         // Construct user object with subscription data
+
         const userWithSubscription = {
             id: user.id,
             name: user.name,
-            email: user.email,
+            phone_number: user.phone_number,
+            referral_code:user.referral_code,
             role:user.role,
+            status:user.status,
             subscription: {
                 plan_name: user.plan_name,
                 price: user.price,
@@ -198,11 +249,14 @@ app.post('/login', (req, res) => {
 
 
 
+
+
+
 // Get all users route
 app.get('/users', (req, res) => {
     // Query the database to get all users along with their subscription details
     db.query(`
-        SELECT u.id, u.name, u.role, u.email, u.status, s.plan_name, s.price, s.description, s.daily_income
+        SELECT u.id, u.name, u.role, u.pending_referral,u.active_referral, u.phone_number,   u.status, s.plan_name, s.price, s.description, s.daily_income
         FROM users u
         LEFT JOIN subscriptions s ON u.subscription_id = s.id`, (err, results) => {
         if (err) {
@@ -224,11 +278,11 @@ app.get('/users', (req, res) => {
 
 
 // get user details
-app.get('/user/:id', verifyToken, (req, res) => {
+app.get('/user/:id', (req, res) => {
     const userId = req.params.id;
 
     db.query(`
-        SELECT u.id, u.name, u.email, u.status, s.plan_name, s.price, s.description, s.daily_income
+        SELECT *
         FROM users u
         LEFT JOIN subscriptions s ON u.subscription_id = s.id
         WHERE u.id = ?`, [userId], (err, results) => {
@@ -240,9 +294,25 @@ app.get('/user/:id', verifyToken, (req, res) => {
             return res.status(404).json({ message: 'User not found' });
         }
 
+        const user = results[0];
+        const userWithSubscription = {
+            id: userId,
+            name: user.name,
+            phone_number: user.phone_number,
+            referral_code:user.referral_code,
+            role:user.role,
+            status:user.status,
+            subscription: {
+                plan_name: user.plan_name,
+                price: user.price,
+                description: user.description,
+                daily_income: user.daily_income
+            }
+        };
+
         return res.status(200).json({
             message: 'User profile fetched successfully',
-            user: results[0], // Contains user details and associated plan details
+            user: userWithSubscription, // Contains user details and associated plan details
         });
     });
 });
@@ -251,7 +321,7 @@ app.get('/user/:id', verifyToken, (req, res) => {
 
 
 // Update user status route
-app.patch('/user/:id/status', verifyToken, (req, res) => {
+app.patch('/user/:id/status', (req, res) => {
     const userId = req.params.id; // Get user ID from route parameter
     const { status } = req.body; // Get status from request body
 
@@ -272,71 +342,108 @@ app.patch('/user/:id/status', verifyToken, (req, res) => {
             return res.status(404).json({ message: 'User not found.' });
         }
 
-        // Update the user's status
-        db.query('UPDATE users SET status = ? WHERE id = ?', [status, userId], (err, result) => {
+        // Fetch the user's details, including their subscription plan
+        db.query(`
+            SELECT u.id, u.name, u.status, s.plan_name, s.price, s.description, u.referred_by
+            FROM users u
+            LEFT JOIN subscriptions s ON u.subscription_id = s.id
+            WHERE u.id = ?`, [userId], (err, updatedUser) => {
             if (err) {
-                console.error('Error updating user status:', err);  // Log the error
-                return res.status(500).json({ message: 'Error updating user status.' });
+                console.error('Error fetching user and subscription details:', err);  // Log the error
+                return res.status(500).json({ message: 'Error fetching user details.' });
             }
 
-            // Fetch the updated user and subscription data
-            db.query(`
-                SELECT u.id, u.name, u.email, u.status, s.plan_name, s.price, s.description
-                FROM users u
-                LEFT JOIN subscriptions s ON u.subscription_id = s.id
-                WHERE u.id = ?`, [userId], (err, updatedUser) => {
-                    if (err) {
-                        console.error('Error fetching updated user details:', err);  // Log the error
-                        return res.status(500).json({ message: 'Error fetching updated user details.' });
-                    }
+            const user = updatedUser[0];
 
-                    // If the user is activated and has a price, update or insert balance
-                    if (status === 'active' && updatedUser[0].price) {
-                        const dailyIncome = updatedUser[0].price;
+            // Check if the user has no plan and prevent status change
+            if (!user.plan_name) {
+                console.error('Cannot change status. User has no subscription plan.');
+                return res.status(400).json({ message: 'Cannot change status. User has no subscription plan.' });
+            }
 
-                        console.log('Checking if balance already exists for user:', userId); // Log check
+            // Update the user's status
+            db.query('UPDATE users SET status = ? WHERE id = ?', [status, userId], (err, result) => {
+                if (err) {
+                    console.error('Error updating user status:', err);  // Log the error
+                    return res.status(500).json({ message: 'Error updating user status.' });
+                }
 
-                        // Check if the user already has a balance record
-                        db.query('SELECT * FROM balance WHERE user_id = ? AND DATE(created_at) = CURDATE()', [userId], (err, balanceRecord) => {
-                            if (err) {
-                                console.error('Error checking existing balance record:', err); // Log error
-                                return res.status(500).json({ message: 'Error checking balance record.' });
-                            }
+                // Handle balance update logic if the user is activated and has a price
+                if (status === 'active' && user.price) {
+                    const dailyIncome = user.price;
 
-                            if (balanceRecord.length > 0) {
-                                console.log('Balance record found, updating balance for user:', userId); // Log update
-                                // If balance record exists, update it
-                                db.query('UPDATE balance SET amount = ? WHERE user_id = ? AND DATE(created_at) = CURDATE()', [dailyIncome, userId], (err, updateResult) => {
-                                    if (err) {
-                                        console.error('Error updating balance:', err); // Log error
-                                        return res.status(500).json({ message: 'Error updating balance.' });
-                                    }
+                    // Check if the user already has a balance record for today
+                    db.query('SELECT * FROM balance WHERE user_id = ? AND DATE(created_at) = CURDATE()', [userId], (err, balanceRecord) => {
+                        if (err) {
+                            console.error('Error checking existing balance record:', err); // Log error
+                            return res.status(500).json({ message: 'Error checking balance record.' });
+                        }
 
-                                    // Calculate total balance for the user
-                                    db.query('SELECT SUM(amount) AS total_balance FROM balance WHERE user_id = ?', [userId], (err, result) => {
+                        if (balanceRecord.length > 0) {
+                            // Update the existing balance record
+                            db.query('UPDATE balance SET amount = ? WHERE user_id = ? AND DATE(created_at) = CURDATE()', [dailyIncome, userId], (err, updateResult) => {
+                                if (err) {
+                                    console.error('Error updating balance:', err); // Log error
+                                    return res.status(500).json({ message: 'Error updating balance.' });
+                                }
+
+                                // Increment the referrer's active_referral count if a referrer exists
+                                if (user.referred_by) {
+                                    console.log('Referred By:', user.referred_by);
+                                
+                                    // Check if the referral already exists in the user_referrals table
+                                    db.query('SELECT * FROM user_referrals WHERE user_id = ? AND referrer_id = ?', [userId, user.referred_by], (err, referralRecord) => {
                                         if (err) {
-                                            console.error('Error calculating total balance:', err); // Log error
-                                            return res.status(500).json({ message: 'Error calculating total balance.' });
+                                            console.error('Error checking referral record:', err);  // Log error
+                                            return res.status(500).json({ message: 'Error checking referral record.' });
                                         }
-
-                                        const totalBalance = result[0].total_balance;
-                                        return res.status(200).json({
-                                            message: 'User status updated successfully and balance updated!',
-                                            user: updatedUser[0], // Full user details with subscription
-                                            total_balance: totalBalance
+                                
+                                        if (referralRecord.length > 0) {
+                                            // If the referral already exists, skip the update
+                                            console.log('Referral already counted for this user.');
+                                            return res.status(200).json({
+                                                message: 'Referral already counted for this user.',
+                                                user: user
+                                            });
+                                        }
+                                
+                                        // Update the referral count for the referrer if not duplicated
+                                        db.query('UPDATE users SET active_referral = IFNULL(active_referral, 0) + 1 WHERE id = ?', [user.referred_by], (err, updateReferral) => {
+                                            if (err) {
+                                                console.error('Error updating active referral count:', err);  // Log error
+                                                return res.status(500).json({ message: 'Error updating referral count.' });
+                                            }
+                                
+                                            console.log('Referral count updated for user ID:', user.referred_by);
+                                
+                                            // Insert the referral record into the user_referrals table
+                                            db.query('INSERT INTO user_referrals (user_id, referrer_id) VALUES (?, ?)', [userId, user.referred_by], (err, insertReferral) => {
+                                                if (err) {
+                                                    console.error('Error inserting referral record:', err);
+                                                    return res.status(500).json({ message: 'Error tracking referral.' });
+                                                }
+                                
+                                                // Calculate total balance for the user
+                                                db.query('SELECT SUM(amount) AS total_balance FROM balance WHERE user_id = ?', [userId], (err, result) => {
+                                                    if (err) {
+                                                        console.error('Error calculating total balance:', err);  // Log error
+                                                        return res.status(500).json({ message: 'Error calculating total balance.' });
+                                                    }
+                                
+                                                    const totalBalance = result[0].total_balance;
+                                                    return res.status(200).json({
+                                                        message: 'User status updated successfully and balance updated!',
+                                                        user: user, // Full user details with subscription
+                                                        total_balance: totalBalance
+                                                    });
+                                                });
+                                            });
                                         });
                                     });
-                                });
-                            } else {
-                                console.log('No existing balance record, inserting new balance entry for user:', userId); // Log insert
-                                // Insert a new balance record for the user
-                                db.query('INSERT INTO balance (user_id, amount) VALUES (?, ?)', [userId, dailyIncome], (err, result) => {
-                                    if (err) {
-                                        console.error('Error inserting into balance table:', err); // Log error
-                                        return res.status(500).json({ message: 'Error updating balance.' });
-                                    }
-
-                                    // Calculate total balance for the user
+                                }
+                                
+                                 else {
+                                    // No referral, just update balance
                                     db.query('SELECT SUM(amount) AS total_balance FROM balance WHERE user_id = ?', [userId], (err, result) => {
                                         if (err) {
                                             console.error('Error calculating total balance:', err); // Log error
@@ -346,20 +453,133 @@ app.patch('/user/:id/status', verifyToken, (req, res) => {
                                         const totalBalance = result[0].total_balance;
                                         return res.status(200).json({
                                             message: 'User status updated successfully and balance inserted!',
-                                            user: updatedUser[0], // Full user details with subscription
+                                            user: user, // Full user details with subscription
                                             total_balance: totalBalance
                                         });
                                     });
-                                });
-                            }
-                        });
-                    } else {
-                        return res.status(200).json({
-                            message: 'User status updated successfully!',
-                            user: updatedUser[0] // User data without subscription change
-                        });
-                    }
-                });
+                                }
+                            });
+                        } else {
+                            // Insert a new balance record for the user
+                            db.query('INSERT INTO balance (user_id, amount) VALUES (?, ?)', [userId, dailyIncome], (err, result) => {
+                                if (err) {
+                                    console.error('Error inserting into balance table:', err); // Log error
+                                    return res.status(500).json({ message: 'Error updating balance.' });
+                                }
+
+                                // Increment the referrer's active_referral count if a referrer exists
+                                if (user.referred_by) {
+                                    // Check if the referral already exists in the user_referrals table
+                                    db.query('SELECT * FROM user_referrals WHERE user_id = ? AND referrer_id = ?', [userId, user.referred_by], (err, referralRecord) => {
+                                        if (err) {
+                                            console.error('Error checking referral record:', err);  // Log error
+                                            return res.status(500).json({ message: 'Error checking referral record.' });
+                                        }
+                                
+                                        if (referralRecord.length > 0) {
+                                            // If the referral already exists, skip the update
+                                            return res.status(200).json({
+                                                message: 'Referral already counted for this user.',
+                                                user: user
+                                            });
+                                        }
+                                
+                                        // Update the referral count for the referrer if not duplicated
+                                        db.query('UPDATE users SET active_referral = IFNULL(active_referral, 0) + 1 WHERE id = ?', [user.referred_by], (err, updateReferral) => {
+                                            if (err) {
+                                                console.error('Error updating active referral count:', err);  // Log error
+                                                return res.status(500).json({ message: 'Error updating referral count.' });
+                                            }
+                                
+                                            console.log('Referral count updated for user ID:', user.referred_by);
+                                
+                                            // Insert the referral record into the user_referrals table
+                                            db.query('INSERT INTO user_referrals (user_id, referrer_id) VALUES (?, ?)', [userId, user.referred_by], (err, insertReferral) => {
+                                                if (err) {
+                                                    console.error('Error inserting referral record:', err);
+                                                    return res.status(500).json({ message: 'Error tracking referral.' });
+                                                }
+                                
+
+                                                    const referrerId = user.referred_by; // Referrer ID
+                                                    const userId = user.id; // User ID (referred user)
+
+                                                    // Fetch the daily income of the referred user
+                                                    db.query(`
+                                                        SELECT s.daily_income 
+                                                        FROM users u
+                                                        LEFT JOIN subscriptions s ON u.subscription_id = s.id
+                                                        WHERE u.id = ?
+                                                    `, [userId], (err, results) => {
+                                                        
+                                                        if (err) {
+                                                            console.error('Error retrieving daily income:', err);
+                                                            return res.status(500).json({ message: 'Error retrieving daily income.' });
+                                                        }
+
+                                                        if (results.length === 0 || results[0].daily_income === null) {
+                                                            return res.status(404).json({ message: 'No daily income found for this user.' });
+                                                        }
+
+                                                        const dailyIncome = results[0].daily_income;
+                                                        const amount = 2 * dailyIncome; // Calculating the amount for the referrer (2 times the daily income)
+
+                                                        // Check if the referrer has already requested a payment today
+                                                        db.query(
+                                                            'SELECT * FROM pending_payments WHERE user_id = ? AND DATE(created_at) = ?',
+                                                            [referrerId, new Date().toISOString().split('T')[0]], // Today's date
+                                                            (err, results) => {
+                                                                if (err) {
+                                                                    console.error('Error checking previous transactions:', err); // Log error
+                                                                    return res.status(500).json({ message: 'Error checking previous transactions.' });
+                                                                }
+
+                                                                // Insert into pending_payments table if no transaction for today
+                                                                db.query('INSERT INTO pending_payments (user_id, amount, status) VALUES (?, ?, ?)', [referrerId, amount, 'pending'], (err, result) => {
+                                                                    if (err) {
+                                                                        return res.status(500).json({ message: 'Error creating transaction request.' });
+                                                                    }
+
+                                                                    return res.status(201).json({
+                                                                        message: 'Referral and transaction request processed successfully.',
+                                                                        transactionId: result.insertId, // Return the ID of the created transaction
+                                                                        user: user // Full user details
+                                                                    });
+                                                                });
+                                                            }
+                                                        );
+                                                    });
+
+                                            });
+                                        });
+                                    });
+                                }
+                                 else {
+                                    // No referral, just update balance
+                                    db.query('SELECT SUM(amount) AS total_balance FROM balance WHERE user_id = ?', [userId], (err, result) => {
+                                        if (err) {
+                                            console.error('Error calculating total balance:', err); // Log error
+                                            return res.status(500).json({ message: 'Error calculating total balance.' });
+                                        }
+
+                                        const totalBalance = result[0].total_balance;
+                                        return res.status(200).json({
+                                            message: 'User status updated successfully and balance inserted!',
+                                            user: user, // Full user details with subscription
+                                            total_balance: totalBalance
+                                        });
+                                    });
+                                }
+                            });
+                        }
+                    });
+                } else {
+                    return res.status(200).json({
+                        message: 'User status updated successfully!',
+                        user: user // User data without subscription change
+                    });
+                }
+            });
         });
     });
 });
@@ -367,8 +587,9 @@ app.patch('/user/:id/status', verifyToken, (req, res) => {
 
 
 
+
 // Add or modify a subscription
-app.post('/subscription', verifyToken, (req, res) => {
+app.post('/subscription', (req, res) => {
     const { id, plan_name, price, description, daily_income } = req.body;
 
     // Check if the required fields are provided
@@ -416,7 +637,7 @@ app.post('/subscription', verifyToken, (req, res) => {
 
 
 // Get all subscription plans
-app.get('/subscriptions', verifyToken, (req, res) => {
+app.get('/subscriptions', (req, res) => {
     // Query the database to get all subscriptions
     db.query('SELECT * FROM subscriptions', (err, results) => {
         if (err) {
@@ -437,7 +658,7 @@ app.get('/subscriptions', verifyToken, (req, res) => {
 });
 
 // Delete a subscription
-app.delete('/subscription/:id', verifyToken, (req, res) => {
+app.delete('/subscription/:id', (req, res) => {
     const subscriptionId = req.params.id; // Get subscription ID from route parameter
 
     // Query the database to check if the subscription exists
@@ -466,6 +687,30 @@ app.delete('/subscription/:id', verifyToken, (req, res) => {
     });
 });
 
+// Get a single subscription by ID
+app.get('/subscription/:id', (req, res) => {
+    const subscriptionId = req.params.id;
+
+    // Query the database to get the subscription with the provided ID
+    db.query('SELECT * FROM subscriptions WHERE id = ?', [subscriptionId], (err, results) => {
+        if (err) {
+            return res.status(500).json({ message: 'Database query error' });
+        }
+
+        // Check if the subscription was found
+        if (results.length === 0) {
+            return res.status(404).json({ message: `Subscription with ID ${subscriptionId} not found` });
+        }
+
+        // Return the subscription
+        res.status(200).json({
+            message: 'Subscription fetched successfully!',
+            subscription: results[0]
+        });
+    });
+});
+
+
 
 
 
@@ -478,7 +723,7 @@ app.delete('/subscription/:id', verifyToken, (req, res) => {
 /////////////////////////transactions request
 
 // POST: Create a new transaction request (pending) with the restriction of one per day
-app.post('/transaction', verifyToken, (req, res) => {
+app.post('/transaction', (req, res) => {
     const { userId, amount } = req.body;
   
     // Validate input data
@@ -696,6 +941,44 @@ app.get('/completed-payments', (req, res) => {
       });
     });
   });
+
+app.get('/all-balances', (req, res) => {
+    const query = `
+            SELECT 
+            b.user_id, 
+            b.amount AS balance, 
+            IFNULL(SUM(t.amount), 0) AS daily_transaction_total
+        FROM 
+            balance b
+        LEFT JOIN 
+            transactions t 
+        ON 
+            b.user_id = t.user_id 
+            AND t.status = 'completed' 
+            AND DATE(t.transaction_date) = CURDATE()
+        GROUP BY 
+            b.user_id, b.amount
+
+            `;
+
+    db.query(query, (err, results) => {
+        if (err) {
+            console.error('Database query error:', err);
+            return res.status(500).json({ message: 'Database query error' });
+        }
+
+        if (results.length === 0) {
+            return res.status(404).json({ message: 'No balance records found' });
+        }
+
+        return res.status(200).json({
+            message: 'All balance records fetched successfully!',
+            balances: results,
+        });
+    });
+});
+
+
   
   
   
